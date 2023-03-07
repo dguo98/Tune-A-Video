@@ -230,12 +230,14 @@ class BasicTransformerBlock(nn.Module):
             # self.attn_temp._use_memory_efficient_attention_xformers = use_memory_efficient_attention_xformers
 
     def forward(self, hidden_states, encoder_hidden_states=None, timestep=None, attention_mask=None, video_length=None):
+        """
         print("!!! in attention: hiddenstates.shape=", hidden_states.shape, " encoder_hidden_states.shape=", encoder_hidden_states.shape,
             "timestep=", timestep)
         if attention_mask is not None:
             print("attention_mask.shape=", attention_mask.shape)
         if video_length is not None:
             print("video_length=", video_length)
+        """
 
         # SparseCausal-Attention
         # Q(demi): what is ada layer norm, why can we also feed in timestep?
@@ -244,7 +246,7 @@ class BasicTransformerBlock(nn.Module):
         )
 
         if self.only_cross_attention:
-            print("self.only cross attention is true")
+            #print("self.only cross attention is true")
             hidden_states = (
                 self.attn1(norm_hidden_states, encoder_hidden_states, attention_mask=attention_mask) + hidden_states
             )

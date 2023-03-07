@@ -348,6 +348,7 @@ class UNet3DConditionModel(ModelMixin, ConfigMixin):
         t_emb = t_emb.to(dtype=self.dtype)
         emb = self.time_embedding(t_emb)
 
+        """
         print("in unet forward")
         print("sample.shape=", sample.shape)
         print("timesteps.shape=", timesteps.shape)
@@ -359,6 +360,7 @@ class UNet3DConditionModel(ModelMixin, ConfigMixin):
         else:
             print("attention_mask is None")
         print("encoder_hidden_states.shape=",encoder_hidden_states.shape)
+        """
 
         
         # Q(demi):what is class embedding for?
@@ -374,7 +376,7 @@ class UNet3DConditionModel(ModelMixin, ConfigMixin):
 
         # pre-process
         sample = self.conv_in(sample)
-        print("sample, go through conv_in, sample.shape=", sample.shape)
+        # print("sample, go through conv_in, sample.shape=", sample.shape)
 
         # down
         down_block_res_samples = (sample,)
@@ -462,13 +464,13 @@ class UNet3DConditionModel(ModelMixin, ConfigMixin):
         if not os.path.isfile(model_file):
             raise RuntimeError(f"{model_file} does not exist")
         state_dict = torch.load(model_file, map_location="cpu")
-        print("in loading from pretrained 2d, check model keys, check original config (json.load config file), and new config")
-        print("check model, model_file, state_dict")
+        #print("in loading from pretrained 2d, check model keys, check original config (json.load config file), and new config")
+        #print("check model, model_file, state_dict")
         for k, v in model.state_dict().items():
             if '_temp.' in k:
                 state_dict.update({k: v})
         model.load_state_dict(state_dict)
-        print("final model")
+        #print("final model")
         #embed()
 
         return model

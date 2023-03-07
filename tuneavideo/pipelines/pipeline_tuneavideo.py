@@ -347,6 +347,7 @@ class TuneAVideoPipeline(DiffusionPipeline):
         text_embeddings = self._encode_prompt(
             prompt, device, num_videos_per_prompt, do_classifier_free_guidance, negative_prompt
         )
+        print("batch_size=", batch_size, " text_embeddings.shape=", text_embeddings.shape)
 
         # Prepare timesteps
         self.scheduler.set_timesteps(num_inference_steps, device=device)
@@ -380,9 +381,10 @@ class TuneAVideoPipeline(DiffusionPipeline):
 
                 # predict the noise residual
                 noise_pred = self.unet(latent_model_input, t, encoder_hidden_states=text_embeddings).sample.to(dtype=latents_dtype)
-                print("@@ latent_model_input.shape=", latent_model_input.shape)
-                print("@@ latents.shape=", latents.shape)
-                print("@@ noise_pred.shape=", noise_pred.shape)
+                if i == 0:
+                    print("@@ latent_model_input.shape=", latent_model_input.shape)
+                    print("@@ latents.shape=", latents.shape)
+                    print("@@ noise_pred.shape=", noise_pred.shape)
 
                 # perform guidance
                 if do_classifier_free_guidance:
