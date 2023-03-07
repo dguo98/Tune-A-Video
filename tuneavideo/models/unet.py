@@ -11,7 +11,7 @@ import torch.nn as nn
 import torch.utils.checkpoint
 
 from diffusers.configuration_utils import ConfigMixin, register_to_config
-from diffusers.modeling_utils import ModelMixin
+from diffusers import ModelMixin
 from diffusers.utils import BaseOutput, logging
 from diffusers.models.embeddings import TimestepEmbedding, Timesteps
 from .unet_blocks import (
@@ -25,6 +25,9 @@ from .unet_blocks import (
 )
 from .resnet import InflatedConv3d
 
+
+import copy
+from IPython import embed
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
@@ -77,6 +80,7 @@ class UNet3DConditionModel(ModelMixin, ConfigMixin):
         resnet_time_scale_shift: str = "default",
     ):
         super().__init__()
+
 
         self.sample_size = sample_size
         time_embed_dim = block_out_channels[0] * 4
@@ -344,6 +348,20 @@ class UNet3DConditionModel(ModelMixin, ConfigMixin):
         t_emb = t_emb.to(dtype=self.dtype)
         emb = self.time_embedding(t_emb)
 
+        print("in unet forward")
+        print("sample.shape=", sample.shape)
+        print("timesteps.shape=", timesteps.shape)
+        print("t_emb.shape=", t_emb.shape)
+        print("emb.shape=", emb.shape)
+        
+        if attention_mask is not None:
+            print("attention_mask.shape=", attention_mask.shape)
+        else:
+            print("attention_mask is None")
+        print("encoder_hidden_states.shape=",encoder_hidden_states.shape)
+
+        
+        # Q(demi):what is class embedding for?
         if self.class_embedding is not None:
             if class_labels is None:
                 raise ValueError("class_labels should be provided when num_class_embeds > 0")
@@ -356,6 +374,7 @@ class UNet3DConditionModel(ModelMixin, ConfigMixin):
 
         # pre-process
         sample = self.conv_in(sample)
+        print("sample, go through conv_in, sample.shape=", sample.shape)
 
         # down
         down_block_res_samples = (sample,)
@@ -422,6 +441,7 @@ class UNet3DConditionModel(ModelMixin, ConfigMixin):
             raise RuntimeError(f"{config_file} does not exist")
         with open(config_file, "r") as f:
             config = json.load(f)
+        old_config = copy.deepcopy(config)
         config["_class_name"] = cls.__name__
         config["down_block_types"] = [
             "CrossAttnDownBlock3D",
@@ -442,9 +462,13 @@ class UNet3DConditionModel(ModelMixin, ConfigMixin):
         if not os.path.isfile(model_file):
             raise RuntimeError(f"{model_file} does not exist")
         state_dict = torch.load(model_file, map_location="cpu")
+        print("in loading from pretrained 2d, check model keys, check original config (json.load config file), and new config")
+        print("check model, model_file, state_dict")
         for k, v in model.state_dict().items():
             if '_temp.' in k:
                 state_dict.update({k: v})
         model.load_state_dict(state_dict)
+        print("final model")
+        #embed()
 
         return model

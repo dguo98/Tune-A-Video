@@ -29,6 +29,8 @@ from tuneavideo.pipelines.pipeline_tuneavideo import TuneAVideoPipeline
 from tuneavideo.util import save_videos_grid, ddim_inversion
 from einops import rearrange
 
+from IPython import embed
+
 
 # Will error if the minimal version of diffusers is not installed. Remove at your own risks.
 check_min_version("0.10.0.dev0")
@@ -259,16 +261,22 @@ def main(
                 pixel_values = batch["pixel_values"].to(weight_dtype)
                 video_length = pixel_values.shape[1]
                 pixel_values = rearrange(pixel_values, "b f c h w -> (b f) c h w")
+                print("pixel_values.shape=", pixel_values.shape)
+                print("video_length=", video_length)
+
                 latents = vae.encode(pixel_values).latent_dist.sample()
                 latents = rearrange(latents, "(b f) c h w -> b c f h w", f=video_length)
                 latents = latents * 0.18215
+                print("latents.shape=", latents.shape)
 
                 # Sample noise that we'll add to the latents
                 noise = torch.randn_like(latents)
                 bsz = latents.shape[0]
                 # Sample a random timestep for each video
                 timesteps = torch.randint(0, noise_scheduler.num_train_timesteps, (bsz,), device=latents.device)
+                print("num train steps=", noise_scheduler.num_train_timesteps)
                 timesteps = timesteps.long()
+                print("timesteps.shape=", timesteps.shape)
 
                 # Add noise to the latents according to the noise magnitude at each timestep
                 # (this is the forward diffusion process)
@@ -276,6 +284,8 @@ def main(
 
                 # Get the text embedding for conditioning
                 encoder_hidden_states = text_encoder(batch["prompt_ids"])[0]
+                print("batch prompt_ids.shape=", batch["prompt_ids"].shape)
+                print("encoder hidden states.shape= ", encoder_hidden_states.shape)
 
                 # Get the target for loss depending on the prediction type
                 if noise_scheduler.prediction_type == "epsilon":

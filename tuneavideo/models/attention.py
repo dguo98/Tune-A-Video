@@ -1,14 +1,14 @@
 # Adapted from https://github.com/huggingface/diffusers/blob/main/src/diffusers/models/attention.py
 
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Callable
 
 import torch
 import torch.nn.functional as F
 from torch import nn
 
 from diffusers.configuration_utils import ConfigMixin, register_to_config
-from diffusers.modeling_utils import ModelMixin
+from diffusers import ModelMixin
 from diffusers.utils import BaseOutput
 from diffusers.utils.import_utils import is_xformers_available
 from diffusers.models.attention import CrossAttention, FeedForward, AdaLayerNorm
@@ -162,7 +162,7 @@ class BasicTransformerBlock(nn.Module):
             dropout=dropout,
             bias=attention_bias,
             cross_attention_dim=cross_attention_dim if only_cross_attention else None,
-            upcast_attention=upcast_attention,
+            upcast_attention=upcast_attention, # Q(demi): what is upcast attention?
         )
         self.norm1 = AdaLayerNorm(dim, num_embeds_ada_norm) if self.use_ada_layer_norm else nn.LayerNorm(dim)
 
@@ -201,7 +201,7 @@ class BasicTransformerBlock(nn.Module):
         nn.init.zeros_(self.attn_temp.to_out[0].weight.data)
         self.norm_temp = AdaLayerNorm(dim, num_embeds_ada_norm) if self.use_ada_layer_norm else nn.LayerNorm(dim)
 
-    def set_use_memory_efficient_attention_xformers(self, use_memory_efficient_attention_xformers: bool):
+    def set_use_memory_efficient_attention_xformers(self, use_memory_efficient_attention_xformers: bool, attention_op: Optional[Callable] = None):
         if not is_xformers_available():
             print("Here is how to install it")
             raise ModuleNotFoundError(
@@ -230,12 +230,21 @@ class BasicTransformerBlock(nn.Module):
             # self.attn_temp._use_memory_efficient_attention_xformers = use_memory_efficient_attention_xformers
 
     def forward(self, hidden_states, encoder_hidden_states=None, timestep=None, attention_mask=None, video_length=None):
+        print("!!! in attention: hiddenstates.shape=", hidden_states.shape, " encoder_hidden_states.shape=", encoder_hidden_states.shape,
+            "timestep=", timestep)
+        if attention_mask is not None:
+            print("attention_mask.shape=", attention_mask.shape)
+        if video_length is not None:
+            print("video_length=", video_length)
+
         # SparseCausal-Attention
+        # Q(demi): what is ada layer norm, why can we also feed in timestep?
         norm_hidden_states = (
             self.norm1(hidden_states, timestep) if self.use_ada_layer_norm else self.norm1(hidden_states)
         )
 
         if self.only_cross_attention:
+            print("self.only cross attention is true")
             hidden_states = (
                 self.attn1(norm_hidden_states, encoder_hidden_states, attention_mask=attention_mask) + hidden_states
             )
@@ -258,6 +267,7 @@ class BasicTransformerBlock(nn.Module):
         hidden_states = self.ff(self.norm3(hidden_states)) + hidden_states
 
         # Temporal-Attention
+        # NB(demi): d = h * w
         d = hidden_states.shape[1]
         hidden_states = rearrange(hidden_states, "(b f) d c -> (b d) f c", f=video_length)
         norm_hidden_states = (
@@ -280,7 +290,7 @@ class SparseCausalAttention(CrossAttention):
 
         query = self.to_q(hidden_states)
         dim = query.shape[-1]
-        query = self.reshape_heads_to_batch_dim(query)
+        query = self.head_to_batch_dim(query)
 
         if self.added_kv_proj_dim is not None:
             raise NotImplementedError
@@ -300,8 +310,8 @@ class SparseCausalAttention(CrossAttention):
         value = torch.cat([value[:, [0] * video_length], value[:, former_frame_index]], dim=2)
         value = rearrange(value, "b f d c -> (b f) d c")
 
-        key = self.reshape_heads_to_batch_dim(key)
-        value = self.reshape_heads_to_batch_dim(value)
+        key = self.head_to_batch_dim(key)
+        value = self.head_to_batch_dim(value)
 
         if attention_mask is not None:
             if attention_mask.shape[-1] != query.shape[1]:

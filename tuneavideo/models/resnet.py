@@ -172,6 +172,7 @@ class ResnetBlock3D(nn.Module):
             self.conv_shortcut = InflatedConv3d(in_channels, out_channels, kernel_size=1, stride=1, padding=0)
 
     def forward(self, input_tensor, temb):
+        print("ResNet3D forward, input_tensor.shape=", input_tensor.shape, " temb.shape=", temb.shape)
         hidden_states = input_tensor
 
         hidden_states = self.norm1(hidden_states)
