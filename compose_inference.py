@@ -17,7 +17,10 @@ decord.bridge.set_bridge('torch')
 
 from annotator.util import resize_image, HWC3
 from annotator.openpose import OpenposeDetector
-apply_openpose = OpenposeDetector()
+from annotator.canny import CannyDetector
+
+apply_canny = CannyDetector()
+pply_openpose = OpenposeDetector()
 
 
 def image_grid(imgs, rows, cols):
@@ -102,7 +105,7 @@ def compose_inference(tvideo_ratio=0.5, savename=None):
 
     sample_start_idx = 0
     sample_frame_rate = 2
-    n_sample_frames = 4
+    n_sample_frames = 24
     height = 512
     width = 512
     video_path = "data/man-skiing.mp4"
@@ -111,6 +114,7 @@ def compose_inference(tvideo_ratio=0.5, savename=None):
     num_inference_steps=50 
     guidance_scale=12.5
 
+    control_type = "canny"   # [canny, openpose]
 
     # load tune-a-video pipeline
     unet = UNet3DConditionModel.from_pretrained(my_model_path, subfolder='unet', torch_dtype=torch.float16).to('cuda')
@@ -120,7 +124,7 @@ def compose_inference(tvideo_ratio=0.5, savename=None):
     tvideo_pipe.enable_vae_slicing()
     
     # load controlnet pipeline
-    controlnet = ControlNetModel.from_pretrained("lllyasviel/sd-controlnet-canny", torch_dtype=torch.float16, cache_dir="./checkpoints")
+    controlnet = ControlNetModel.from_pretrained(f"lllyasviel/sd-controlnet-{control_type}", torch_dtype=torch.float16, cache_dir="./checkpoints")
     controlnet_pipe = StableDiffusionControlNetPipeline.from_pretrained(
         "runwayml/stable-diffusion-v1-5", controlnet=controlnet, torch_dtype=torch.float16, cache_dir="./checkpoints"
     )
@@ -135,12 +139,13 @@ def compose_inference(tvideo_ratio=0.5, savename=None):
 
     ## load frames from original training video
     video = get_video(video_path, height, width, sample_start_idx, sample_frame_rate, n_sample_frames)
-    control_images = get_control_images(video, height, width, n_sample_frames)  # [f, c, h, w]
+    control_images = get_control_images(video, height, width, n_sample_frames, control_type)  # [f, c, h, w]
     assert control_images.shape == (n_sample_frames, 3, height, width)
 
 
     # set parameters 
-    prompt = "spider man is skiing" #+ ", best quality, extremely detailed"
+    #prompt = "spider man is skiing" #+ ", best quality, extremely detailed"
+    prompt = "a man is skiing, acrylic painting, trending on pixiv fanbox, palette knife and brush strokes, style of makoto shinkai jamie wyeth james gilleard edward hopper greg rutkowski studio ghibli genshin impact, best quality, extremely detailed"
     ddim_inv_latent = torch.load(f"{my_model_path}/inv_latents/ddim_latent-500.pt").to(torch.float16)
     #print("!!!!!!! ddim_inv_latent.shape=",ddim_inv_latent.shape)
     assert ddim_inv_latent.shape[2] == 24
@@ -164,21 +169,35 @@ def get_video(video_path, height, width, sample_start_idx, sample_frame_rate, n_
     return video
 
 
-def get_control_images(video, height, width, n_sample_frames, detect_resolution=512):
+def get_control_images(video, height, width, n_sample_frames, control_type, detect_resolution=512):
     assert video.shape == (n_sample_frames, height, width, 3)
     image_resolution = min(height, width)  # HACK(demi): need to rethink about this
+
+    if control_type == "canny":
+        detect_resolution = image_resolution
+        low_threshold = 100
+        high_threshold = 200
 
     control_images = []
     for i in range(n_sample_frames):
         input_image = video[i].cpu().numpy()
         input_image = HWC3(input_image)
-        detected_map, _ = apply_openpose(resize_image(input_image, detect_resolution))
+
+        if control_type == "openpose":
+            detected_map, _ = apply_openpose(resize_image(input_image, detect_resolution))
+        elif control_type == "canny":
+            detected_map = apply_canny(resize_image(input_image, detect_resolution), low_threshold, high_threshold)
+        else:
+            raise NotImplementedError
         detected_map = HWC3(detected_map)  # TODO(demi): check if pose is correct
         img = resize_image(input_image, image_resolution)
         H, W, C = img.shape
         assert H == height and W == width  # HACK(demi)
 
         detected_map = cv2.resize(detected_map, (W, H), interpolation=cv2.INTER_NEAREST)
+        # DEBUG(demi): store conditional images
+        Image.fromarray(detected_map).save(f"{control_type}_cond_image_{i}.jpg")
+
         control = torch.from_numpy(detected_map.copy()).float().cuda() / 255.0
         control_images.append(control)
     control_images = torch.stack(control_images, dim=0)
@@ -322,8 +341,8 @@ def _call_compose_inference(tvideo_pipe, controlnet_pipe, tvideo_ratio, prompt, 
 
             # TODO(demi): double check if the re-arrangement makes sense
             lc, lh, lw = controlnet_noise_pred.shape[-3:]
-            controlnet_noise_pred = controlnet_noise_pred.reshape(batch_size, video_length, multiplier, lc, lh, lw)
-            controlnet_noise_pred = rearrange(controlnet_noise_pred, 'b f m c h w -> (b m) c f h w')
+            controlnet_noise_pred = controlnet_noise_pred.reshape(multiplier, batch_size, video_length, lc, lh, lw)
+            controlnet_noise_pred = rearrange(controlnet_noise_pred, 'm b f c h w -> (m b) c f h w')
             assert tvideo_noise_pred.shape == controlnet_noise_pred.shape
             
             noise_pred = tvideo_noise_pred * tvideo_ratio + controlnet_noise_pred * (1-tvideo_ratio)
@@ -362,4 +381,5 @@ if __name__ == "__main__":
     #tvideo_inference() 
     #controlnet_inference()
     compose_inference(tvideo_ratio=1.0, savename="./tvideo_debug.gif")
+    compose_inference(tvideo_ratio=0.5, savename="./compose_debug.gif")
 
