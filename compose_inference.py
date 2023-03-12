@@ -96,22 +96,26 @@ def controlnet_inference():
     image_grid(output.images, 2, 2)
 
 
-def compose_inference(tvideo_ratio=0.5, savename=None):
+def compose_inference(tvideo_ratio=0.5, savename=None, use_ddim=True):
 
     # load config (should be the same as corresponding config file
-    config_file = "configs/man-skiing.yaml"
+    suffix = "car-turn"
+    config_file = f"configs/{suffix}.yaml"
     pretrained_model_path = "./checkpoints/models--CompVis--stable-diffusion-v1-4/snapshots/3857c45b7d4e78b3ba0f39d4d7f50a2a05aa23d4"
-    my_model_path = "./outputs/man-skiing"
+    my_model_path = f"./outputs/{suffix}"
 
+    #prompt = "spider man is skiing" #+ ", best quality, extremely detailed"
+    prompt = "a white car is turning, white Jeep car, grey road with no shadows, white mountains, snow on the mountain,  acrylic painting, trending on pixiv fanbox, palette knife and brush strokes, style of makoto shinkai jamie wyeth james gilleard edward hopper greg rutkowski studio ghibli genshin impact, best quality, extremely detailed"
+    #prompt = "a man is skiing, best quality, extremely detailed" + "neon ambiance, abstract black oil, gear mecha, detailed acrylic, grunge, intricate complexity, rendered in unreal engine, photorealistic"
     sample_start_idx = 0
     sample_frame_rate = 2
     n_sample_frames = 24
     height = 512
     width = 512
-    video_path = "data/man-skiing.mp4"
+    video_path = f"data/{suffix}.mp4"
 
     video_length = n_sample_frames
-    num_inference_steps=50 
+    num_inference_steps=50
     guidance_scale=12.5
 
     control_type = "canny"   # [canny, openpose]
@@ -144,12 +148,12 @@ def compose_inference(tvideo_ratio=0.5, savename=None):
 
 
     # set parameters 
-    #prompt = "spider man is skiing" #+ ", best quality, extremely detailed"
-    prompt = "a man is skiing, acrylic painting, trending on pixiv fanbox, palette knife and brush strokes, style of makoto shinkai jamie wyeth james gilleard edward hopper greg rutkowski studio ghibli genshin impact, best quality, extremely detailed"
     ddim_inv_latent = torch.load(f"{my_model_path}/inv_latents/ddim_latent-500.pt").to(torch.float16)
     #print("!!!!!!! ddim_inv_latent.shape=",ddim_inv_latent.shape)
     assert ddim_inv_latent.shape[2] == 24
     ddim_inv_latent = ddim_inv_latent[:, :, :n_sample_frames]
+    if not use_ddim:
+        ddim_inv_latent=None
 
     with torch.no_grad():
         video = _call_compose_inference(tvideo_pipe, controlnet_pipe, tvideo_ratio, prompt, control_images, latents=ddim_inv_latent, video_length=video_length, height=height, width=width, num_inference_steps=num_inference_steps, guidance_scale=guidance_scale)
@@ -232,12 +236,17 @@ def _call_compose_inference(tvideo_pipe, controlnet_pipe, tvideo_ratio, prompt, 
     )
 
     # NB(demi): size should assume video_length is batch size
+    if negative_prompt is None:
+        negative_prompt = ["monochrome, lowres, bad anatomy, worst quality, low quality"] 
+    elif type(negative_prompt) is str:
+        negative_prompt = [negative_prompt]
+
     controlnet_prompt_embeds = controlnet_pipe._encode_prompt(
         [prompt] * video_length,  # TODO(demi): make sure this is correct
         device,
         num_images_per_prompt,
         do_classifier_free_guidance,
-        negative_prompt,
+        negative_prompt=negative_prompt*video_length,
         prompt_embeds=None,
         negative_prompt_embeds=None,
     )
@@ -272,17 +281,37 @@ def _call_compose_inference(tvideo_pipe, controlnet_pipe, tvideo_ratio, prompt, 
     # TODO(demi): now, default using tune-a-video latent processing
 
     #print("video_length=", video_length, "latents.shape=", latents.shape)
-    latents = tvideo_pipe.prepare_latents(
-        batch_size * num_videos_per_prompt,
-        num_channels_latents,
-        video_length,
-        height,
-        width,
-        tvideo_text_embeddings.dtype,
-        device,
-        generator,
-        latents,
-    )
+    
+    # TODO(demi): check this hack
+    # HACK(demi): use controlnet latents
+    if latents is not None:
+        generator = [torch.Generator(device="cpu").manual_seed(2) for i in range(batch_size)]
+        latents = tvideo_pipe.prepare_latents(
+            batch_size * num_videos_per_prompt,
+            num_channels_latents,
+            video_length,
+            height,
+            width,
+            tvideo_text_embeddings.dtype,
+            device,
+            generator,
+            latents,
+        )
+    else:
+        generator = [torch.Generator(device="cpu").manual_seed(2) for i in range(video_length)]
+        latents = controlnet_pipe.prepare_latents(
+            video_length,
+            num_channels_latents,
+            height,
+            width,
+            controlnet_prompt_embeds.dtype,
+            device,
+            generator,
+            latents,
+        )
+        latents = rearrange(latents, "f c h w -> c f h w").unsqueeze(0)
+        print("latents.shape=", latents.shape)
+ 
     latents_dtype = latents.dtype
 
     # Prepare extra step kwargs.
@@ -380,6 +409,10 @@ def _call_compose_inference(tvideo_pipe, controlnet_pipe, tvideo_ratio, prompt, 
 if __name__ == "__main__":
     #tvideo_inference() 
     #controlnet_inference()
-    compose_inference(tvideo_ratio=1.0, savename="./tvideo_debug.gif")
-    compose_inference(tvideo_ratio=0.5, savename="./compose_debug.gif")
+    #compose_inference(tvideo_ratio=1.0, savename="./tvideo_debug.gif")
+    #compose_inference(tvideo_ratio=0.5, savename="./carturn_compose_0p5_acrylic_gs12p5_detail_v2_ddim.gif")
+    #compose_inference(tvideo_ratio=0.3, savename="./carturn_compose_0p3_acrylic_gs12p5_detail_v2_ddim.gif")
+    #compose_inference(tvideo_ratio=0.7, savename="./carturn_compose_0p7_acrylic_gs12p5_detail_v2_ddim.gif")
+    #compose_inference(tvideo_ratio=0.0, savename="./carturn_controlnet_acrylic_d50_gs12p5_detail_v2_ddim.gif", use_ddim=True)
+    compose_inference(tvideo_ratio=1.0, savename="./carturn_tvideo_acrylic_d50_detail_v2.gif")
 
