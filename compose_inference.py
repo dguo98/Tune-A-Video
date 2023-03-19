@@ -1,4 +1,7 @@
+import os
+
 from tuneavideo.pipelines.pipeline_tuneavideo import TuneAVideoPipeline
+from tuneavideo.models.adapter import StyleAdapter
 from tuneavideo.models.unet import UNet3DConditionModel
 from tuneavideo.util import save_videos_grid
 
@@ -20,7 +23,7 @@ from annotator.openpose import OpenposeDetector
 from annotator.canny import CannyDetector
 
 apply_canny = CannyDetector()
-pply_openpose = OpenposeDetector()
+apply_openpose = OpenposeDetector()
 
 
 def image_grid(imgs, rows, cols):
@@ -36,21 +39,37 @@ def image_grid(imgs, rows, cols):
 
 
 
-def tvideo_inference():
-    pretrained_model_path = "./checkpoints/models--CompVis--stable-diffusion-v1-4/snapshots/3857c45b7d4e78b3ba0f39d4d7f50a2a05aa23d4"
-    my_model_path = "./outputs/man-skiing"
+def tvideo_inference(style_image=None, save_name=None):
+    # pretrained_model_path = "./checkpoints/models--CompVis--stable-diffusion-v1-4/snapshots/3857c45b7d4e78b3ba0f39d4d7f50a2a05aa23d4"
+    pretrained_model_path = "./checkpoints/stable-diffusion-v1-4"
+    my_model_path = "./outputs/car-turn"
     unet = UNet3DConditionModel.from_pretrained(my_model_path, subfolder='unet', torch_dtype=torch.float16).to('cuda')
 
-    tvideo_pipe = TuneAVideoPipeline.from_pretrained(pretrained_model_path, unet=unet, torch_dtype=torch.float16).to("cuda")
+    if style_image is not None:
+        style_adapter = StyleAdapter(width=1024, context_dim=768, num_head=8, n_layes=3, num_token=8).to("cuda")
+        ckpt_path = "./checkpoints/T2I-Adapter/models/t2iadapter_style_sd14v1.pth"
+        style_adapter.load_state_dict(torch.load(ckpt_path))
+    else:
+        style_adapter = None
+
+    tvideo_pipe = TuneAVideoPipeline.from_pretrained(
+        pretrained_model_path, unet=unet, style_adapter=style_adapter, torch_dtype=torch.float16).to("cuda")
     tvideo_pipe.enable_xformers_memory_efficient_attention()
     tvideo_pipe.enable_vae_slicing()
 
 
-    prompt = "spider man is skiing"
+    prompt = "a white car is turning, white Jeep car, grey road with no shadows, white mountains, snow on the mountain,  acrylic painting, trending on pixiv fanbox, palette knife and brush strokes, style of makoto shinkai jamie wyeth james gilleard edward hopper greg rutkowski studio ghibli genshin impact, best quality, extremely detailed"
     ddim_inv_latent = torch.load(f"{my_model_path}/inv_latents/ddim_latent-500.pt").to(torch.float16)
-    video = tvideo_pipe(prompt, latents=ddim_inv_latent, video_length=24, height=512, width=512, num_inference_steps=50, guidance_scale=12.5).videos
+    if isinstance(style_image, list):
+        prompt = [prompt] * len(style_image)
+        ddim_inv_latent = ddim_inv_latent.repeat(len(style_image), 1, 1, 1, 1)
+    video = tvideo_pipe(
+        prompt, latents=ddim_inv_latent, video_length=24, height=512, width=512, num_inference_steps=50, guidance_scale=12.5,
+        style_image=style_image).videos
 
-    save_videos_grid(video, f"./{prompt}.gif")
+    if save_name is None:
+        save_name = prompt
+    save_videos_grid(video, f"./{save_name}.gif")
 
 
 def controlnet_inference():
@@ -407,12 +426,23 @@ def _call_compose_inference(tvideo_pipe, controlnet_pipe, tvideo_ratio, prompt, 
 
 
 if __name__ == "__main__":
-    #tvideo_inference() 
+    style_image = [
+        './data/style/Bianjing_city_gate.jpeg',
+        './data/style/Claude_Monet,_Impression,_soleil_levant,_1872.jpeg',
+        './data/style/DVwG-hevauxk1601457.jpeg',
+        './data/style/The_Persistence_of_Memory.jpeg',
+        './data/style/Tsunami_by_hokusai_19th_century.jpeg',
+        './data/style/Van_Gogh_-_Starry_Night_-_Google_Art_Project.jpeg',
+        './data/style/cyberpunk.png',
+        './data/style/scream.jpeg'
+    ]
+
+    tvideo_inference(save_name="car-turn")
+    tvideo_inference(style_image=style_image, save_name="car-turn-style")
     #controlnet_inference()
     #compose_inference(tvideo_ratio=1.0, savename="./tvideo_debug.gif")
     #compose_inference(tvideo_ratio=0.5, savename="./carturn_compose_0p5_acrylic_gs12p5_detail_v2_ddim.gif")
     #compose_inference(tvideo_ratio=0.3, savename="./carturn_compose_0p3_acrylic_gs12p5_detail_v2_ddim.gif")
     #compose_inference(tvideo_ratio=0.7, savename="./carturn_compose_0p7_acrylic_gs12p5_detail_v2_ddim.gif")
     #compose_inference(tvideo_ratio=0.0, savename="./carturn_controlnet_acrylic_d50_gs12p5_detail_v2_ddim.gif", use_ddim=True)
-    compose_inference(tvideo_ratio=1.0, savename="./carturn_tvideo_acrylic_d50_detail_v2.gif")
-
+    #compose_inference(tvideo_ratio=1.0, savename="./carturn_tvideo_acrylic_d50_detail_v2.gif")

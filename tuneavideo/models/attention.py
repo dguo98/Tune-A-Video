@@ -338,3 +338,86 @@ class SparseCausalAttention(CrossAttention):
         # dropout
         hidden_states = self.to_out[1](hidden_states)
         return hidden_states
+
+    def _attention(self, query, key, value, attention_mask=None):
+        if self.upcast_attention:
+            query = query.float()
+            key = key.float()
+
+        attention_scores = torch.baddbmm(
+            torch.empty(query.shape[0], query.shape[1], key.shape[1], dtype=query.dtype, device=query.device),
+            query,
+            key.transpose(-1, -2),
+            beta=0,
+            alpha=self.scale,
+        )
+
+        if attention_mask is not None:
+            attention_scores = attention_scores + attention_mask
+
+        if self.upcast_softmax:
+            attention_scores = attention_scores.float()
+
+        attention_probs = attention_scores.softmax(dim=-1)
+
+        # cast back to the original dtype
+        attention_probs = attention_probs.to(value.dtype)
+
+        # compute attention output
+        hidden_states = torch.bmm(attention_probs, value)
+
+        # reshape hidden_states
+        hidden_states = self.batch_to_head_dim(hidden_states)
+        return hidden_states
+
+    def _sliced_attention(self, query, key, value, sequence_length, dim, attention_mask):
+        batch_size_attention = query.shape[0]
+        hidden_states = torch.zeros(
+            (batch_size_attention, sequence_length, dim // self.heads), device=query.device, dtype=query.dtype
+        )
+        slice_size = self._slice_size if self._slice_size is not None else hidden_states.shape[0]
+        for i in range(hidden_states.shape[0] // slice_size):
+            start_idx = i * slice_size
+            end_idx = (i + 1) * slice_size
+
+            query_slice = query[start_idx:end_idx]
+            key_slice = key[start_idx:end_idx]
+
+            if self.upcast_attention:
+                query_slice = query_slice.float()
+                key_slice = key_slice.float()
+
+            attn_slice = torch.baddbmm(
+                torch.empty(slice_size, query.shape[1], key.shape[1], dtype=query_slice.dtype, device=query.device),
+                query_slice,
+                key_slice.transpose(-1, -2),
+                beta=0,
+                alpha=self.scale,
+            )
+
+            if attention_mask is not None:
+                attn_slice = attn_slice + attention_mask[start_idx:end_idx]
+
+            if self.upcast_softmax:
+                attn_slice = attn_slice.float()
+
+            attn_slice = attn_slice.softmax(dim=-1)
+
+            # cast back to the original dtype
+            attn_slice = attn_slice.to(value.dtype)
+            attn_slice = torch.bmm(attn_slice, value[start_idx:end_idx])
+
+            hidden_states[start_idx:end_idx] = attn_slice
+
+        # reshape hidden_states
+        hidden_states = self.batch_to_head_dim(hidden_states)
+        return hidden_states
+
+    def _memory_efficient_attention_xformers(self, query, key, value, attention_mask):
+        # TODO attention_mask
+        query = query.contiguous()
+        key = key.contiguous()
+        value = value.contiguous()
+        hidden_states = xformers.ops.memory_efficient_attention(query, key, value, attn_bias=attention_mask)
+        hidden_states = self.batch_to_head_dim(hidden_states)
+        return hidden_states
