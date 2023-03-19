@@ -11,7 +11,6 @@ from diffusers import UniPCMultistepScheduler
 
 import torch
 import cv2
-import os
 from PIL import Image
 import numpy as np
 from einops import rearrange

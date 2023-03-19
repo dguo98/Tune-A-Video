@@ -41,7 +41,7 @@ class TuneAVideoPipelineOutput(BaseOutput):
 
 
 class TuneAVideoPipeline(DiffusionPipeline):
-    _optional_components = ["style_adapter"]
+    _optional_components = ["style_adapter", "processor", "clip_vision_model"]
 
     def __init__(
         self,
