@@ -41,7 +41,7 @@ class TuneAVideoPipelineOutput(BaseOutput):
 
 
 class TuneAVideoPipeline(DiffusionPipeline):
-    _optional_components = ["style_adapter", "processor", "clip_vision_model"]
+    _optional_components = ["style_adapter"]
 
     def __init__(
         self,
@@ -123,11 +123,9 @@ class TuneAVideoPipeline(DiffusionPipeline):
             model_name = 'openai/clip-vit-large-patch14'
             processor = CLIPProcessor.from_pretrained(model_name)
             clip_vision_model = CLIPVisionModel.from_pretrained(model_name).to("cuda")
-            self.register_modules(
-                style_adapter=style_adapter,
-                processor=processor,
-                clip_vision_model=clip_vision_model,
-            )
+            self.style_adapter = style_adapter
+            self.processor = processor
+            self.clip_vision_model = clip_vision_model
 
     def enable_vae_slicing(self):
         self.vae.enable_slicing()
@@ -362,7 +360,7 @@ class TuneAVideoPipeline(DiffusionPipeline):
         negative_prompt: Optional[Union[str, List[str]]] = None,
         num_videos_per_prompt: Optional[int] = 1,
         style_image: Optional[Union[str, List[str]]] = None,
-        style_cond_ratio: float = 0.5,
+        style_cond_ratio: float = 1.0,
         eta: float = 0.0,
         generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
         latents: Optional[torch.FloatTensor] = None,

@@ -39,7 +39,7 @@ def image_grid(imgs, rows, cols):
 
 
 
-def tvideo_inference(style_image=None, save_name=None):
+def tvideo_inference(style_image=None, savename=None):
     # pretrained_model_path = "./checkpoints/models--CompVis--stable-diffusion-v1-4/snapshots/3857c45b7d4e78b3ba0f39d4d7f50a2a05aa23d4"
     pretrained_model_path = "./checkpoints/stable-diffusion-v1-4"
     my_model_path = "./outputs/car-turn"
@@ -67,9 +67,9 @@ def tvideo_inference(style_image=None, save_name=None):
         prompt, latents=ddim_inv_latent, video_length=24, height=512, width=512, num_inference_steps=50, guidance_scale=12.5,
         style_image=style_image).videos
 
-    if save_name is None:
-        save_name = prompt
-    save_videos_grid(video, f"./{save_name}.gif")
+    if savename is None:
+        savename = prompt + '.gif'
+    save_videos_grid(video, savename)
 
 
 def controlnet_inference():
@@ -424,11 +424,11 @@ if __name__ == "__main__":
         './data/style/scream.jpeg'
     ]
 
-    tvideo_inference(save_name="car-turn")
-    tvideo_inference(style_image=style_image, save_name="car-turn-style")
-    #controlnet_inference()
+    os.makedirs("results/carturn", exist_ok=True)
 
-    os.makedirs("results/carturn", exists_ok=True)
+    tvideo_inference(savename="results/carturn/carturn.gif")
+    tvideo_inference(style_image=style_image, savename="results/carturn/carturn-style.gif")
+    #controlnet_inference()
 
     for tvideo_ratio in [0.0, 0.3, 1.0]:
         control_ratio = 1-tvideo_ratio
