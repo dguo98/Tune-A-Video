@@ -27,7 +27,6 @@ from diffusers.utils import deprecate, logging, BaseOutput
 
 from einops import rearrange
 
-from ..models.adapter import StyleAdapter
 from ..models.unet import UNet3DConditionModel
 from IPython import embed
 
@@ -41,7 +40,7 @@ class TuneAVideoPipelineOutput(BaseOutput):
 
 
 class TuneAVideoPipeline(DiffusionPipeline):
-    _optional_components = ["style_adapter"]
+    _optional_components = []
 
     def __init__(
         self,
@@ -57,7 +56,6 @@ class TuneAVideoPipeline(DiffusionPipeline):
             EulerAncestralDiscreteScheduler,
             DPMSolverMultistepScheduler,
         ],
-        style_adapter: Optional[StyleAdapter] = None,
     ):
         super().__init__()
 
@@ -118,15 +116,6 @@ class TuneAVideoPipeline(DiffusionPipeline):
         )
         self.vae_scale_factor = 2 ** (len(self.vae.config.block_out_channels) - 1)
 
-        if style_adapter is not None:
-            from transformers import CLIPProcessor, CLIPVisionModel
-            model_name = 'openai/clip-vit-large-patch14'
-            processor = CLIPProcessor.from_pretrained(model_name)
-            clip_vision_model = CLIPVisionModel.from_pretrained(model_name).to("cuda")
-            self.style_adapter = style_adapter
-            self.processor = processor
-            self.clip_vision_model = clip_vision_model
-
     def enable_vae_slicing(self):
         self.vae.enable_slicing()
 
@@ -159,16 +148,8 @@ class TuneAVideoPipeline(DiffusionPipeline):
                 return torch.device(module._hf_hook.execution_device)
         return self.device
 
-    def _encode_style(self, style_image, device):
-        style = [Image.open(s) for s in style_image]
-        style_for_clip = self.processor(images=style, return_tensors="pt")['pixel_values']
-        style_feat = self.clip_vision_model(style_for_clip.to(device))['last_hidden_state']
-
-        style_feat = self.style_adapter(style_feat)
-        return style_feat
-
-    def _encode_prompt_and_style(
-        self, prompt, device, num_videos_per_prompt, do_classifier_free_guidance, negative_prompt, style_image=None):
+    def _encode_prompt(
+        self, prompt, device, num_videos_per_prompt, do_classifier_free_guidance, negative_prompt):
         batch_size = len(prompt) if isinstance(prompt, list) else 1
 
         text_inputs = self.tokenizer(
@@ -203,27 +184,6 @@ class TuneAVideoPipeline(DiffusionPipeline):
         bs_embed, seq_len, _ = text_embeddings.shape
         text_embeddings = text_embeddings.repeat(1, num_videos_per_prompt, 1)
         text_embeddings = text_embeddings.view(bs_embed * num_videos_per_prompt, seq_len, -1)
-
-        if style_image is None:
-            style_embeddings = None
-        elif type(prompt) is not type(style_image):
-            raise TypeError(
-                f"`style_image` should be the same type to `prompt`, but got {type(style_image)} !="
-                f" {type(prompt)}."
-            )
-        else:
-            if isinstance(style_image, str):
-                style_image = [style_image] * batch_size
-            elif batch_size != len(style_image):
-                raise ValueError(
-                    f"`style_image`: {style_image} has batch size {len(style_image)}, but `prompt`:"
-                    f" {prompt} has batch size {batch_size}. Please make sure that passed `style_image` matches"
-                    " the batch size of `prompt`."
-                )
-            style_embeddings = self._encode_style(style_image, device).to(text_embeddings.dtype)
-            bs_embed, seq_len, _ = style_embeddings.shape
-            style_embeddings = style_embeddings.repeat(1, num_videos_per_prompt, 1)
-            style_embeddings = style_embeddings.view(bs_embed * num_videos_per_prompt, seq_len, -1)
 
         # get unconditional embeddings for classifier free guidance
         if do_classifier_free_guidance:
@@ -272,9 +232,11 @@ class TuneAVideoPipeline(DiffusionPipeline):
             uncond_embeddings = uncond_embeddings.view(batch_size * num_videos_per_prompt, seq_len, -1)
 
             # For classifier free guidance, we need to do two forward passes.
-            text_embeddings = [uncond_embeddings, text_embeddings]
+            # Here we concatenate the unconditional and text embeddings into a single batch
+            # to avoid doing two forward passes
+            text_embeddings = torch.cat([uncond_embeddings, text_embeddings])
 
-        return text_embeddings, style_embeddings
+        return text_embeddings
 
     def decode_latents(self, latents):
         video_length = latents.shape[2]
@@ -359,7 +321,9 @@ class TuneAVideoPipeline(DiffusionPipeline):
         guidance_scale: float = 7.5,
         negative_prompt: Optional[Union[str, List[str]]] = None,
         num_videos_per_prompt: Optional[int] = 1,
-        style_image: Optional[Union[str, List[str]]] = None,
+        adapter_features: Optional[List[torch.Tensor]] = None,
+        adpater_cond_ratio: float = 1.0,
+        style_embeddings: Optional[torch.Tensor] = None,
         style_cond_ratio: float = 1.0,
         eta: float = 0.0,
         generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
@@ -386,10 +350,8 @@ class TuneAVideoPipeline(DiffusionPipeline):
         do_classifier_free_guidance = guidance_scale > 1.0
 
         # Encode input prompt and optional style image
-        text_embeddings, style_embeddings = self._encode_prompt_and_style(
-            prompt, device, num_videos_per_prompt, do_classifier_free_guidance, negative_prompt,
-            style_image
-        )
+        text_embeddings = self._encode_prompt(
+            prompt, device, num_videos_per_prompt, do_classifier_free_guidance, negative_prompt)
         print("batch_size=", batch_size)
 
         # Prepare timesteps
@@ -404,7 +366,7 @@ class TuneAVideoPipeline(DiffusionPipeline):
             video_length,
             height,
             width,
-            text_embeddings[0].dtype,
+            text_embeddings.dtype,
             device,
             generator,
             latents,
@@ -416,8 +378,9 @@ class TuneAVideoPipeline(DiffusionPipeline):
 
         # Denoising loop
         num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
-        # following the original T2I-Adapter implementation, only apply style conditioning when
-        # the current step number is less than num_style_steps
+        # following the original T2I-Adapter implementation, only apply adapter conditioning when
+        # the current step number is less than a certain threshold
+        num_adapter_steps = len(timesteps) - int((1 - adpater_cond_ratio) * len(timesteps))
         num_style_steps = len(timesteps) - int((1 - style_cond_ratio) * len(timesteps))
         with self.progress_bar(total=num_inference_steps) as progress_bar:
             for i, t in enumerate(timesteps):
@@ -428,24 +391,31 @@ class TuneAVideoPipeline(DiffusionPipeline):
                 # append style embeddings to text embeddings, and pad unconditional embeddings accordingly
                 if style_embeddings is not None and i < num_style_steps:
                     if do_classifier_free_guidance:
-                        uc, c = text_embeddings
+                        uc, c = text_embeddings.chunk(2)
                     else:
                         c = text_embeddings
-                    pad_len = style_embeddings.size(1)
-                    uc = torch.cat([uc, uc[:, -pad_len:, :]], dim=1)
                     c = torch.cat([c, style_embeddings], dim=1)
-                    # Here we concatenate the unconditional and text embeddings into a single batch
-                    # to avoid doing two forward passes
-                    c = torch.cat([uc, c])
-                elif do_classifier_free_guidance:
-                    c = torch.cat(text_embeddings)
+                    if do_classifier_free_guidance:
+                        pad_len = style_embeddings.size(1)
+                        uc = torch.cat([uc, uc[:, -pad_len:, :]], dim=1)
+                        c = torch.cat([uc, c])
+                else:
+                    c = text_embeddings
+
+                # apply adapter_features
+                a = adapter_features if i < num_adapter_steps else None
+                if do_classifier_free_guidance and a is not None:
+                    a = [torch.cat([f] * 2) for f in a]
 
                 # predict the noise residual
-                noise_pred = self.unet(latent_model_input, t, encoder_hidden_states=c).sample.to(dtype=latents_dtype)
-                if i == 0 or i == num_style_steps:
+                noise_pred = self.unet(latent_model_input, t, encoder_hidden_states=c, adapter_features=a).sample.to(dtype=latents_dtype)
+                if i == 0:
                     print("@@ latent_model_input.shape=", latent_model_input.shape)
                     print("@@ latents.shape=", latents.shape)
                     print("@@ c.shape=", c.shape, "(text and optional style embeddings)")
+                    print("@@ text_embeddings.shape=", text_embeddings.shape)
+                    if adapter_features is not None:
+                        print("@@ adapter_features.shape=", [f.shape for f in adapter_features])
                     print("@@ noise_pred.shape=", noise_pred.shape)
 
                 # perform guidance

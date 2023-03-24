@@ -282,10 +282,11 @@ class CrossAttnDownBlock3D(nn.Module):
 
         self.gradient_checkpointing = False
 
-    def forward(self, hidden_states, temb=None, encoder_hidden_states=None, attention_mask=None):
+    def forward(self, hidden_states, temb=None, encoder_hidden_states=None,
+                attention_mask=None, adapter_feature=None):
         output_states = ()
 
-        for resnet, attn in zip(self.resnets, self.attentions):
+        for i, (resnet, attn) in enumerate(zip(self.resnets, self.attentions)):
             if self.training and self.gradient_checkpointing:
 
                 def create_custom_forward(module, return_dict=None):
@@ -306,6 +307,9 @@ class CrossAttnDownBlock3D(nn.Module):
             else:
                 hidden_states = resnet(hidden_states, temb)
                 hidden_states = attn(hidden_states, encoder_hidden_states=encoder_hidden_states).sample
+
+            if i == len(self.resnets) - 1 and adapter_feature is not None:
+                hidden_states += adapter_feature
 
             output_states += (hidden_states,)
 
@@ -370,10 +374,10 @@ class DownBlock3D(nn.Module):
 
         self.gradient_checkpointing = False
 
-    def forward(self, hidden_states, temb=None):
+    def forward(self, hidden_states, temb=None, adapter_feature=None):
         output_states = ()
 
-        for resnet in self.resnets:
+        for i, resnet in enumerate(self.resnets):
             if self.training and self.gradient_checkpointing:
 
                 def create_custom_forward(module):
@@ -385,6 +389,9 @@ class DownBlock3D(nn.Module):
                 hidden_states = torch.utils.checkpoint.checkpoint(create_custom_forward(resnet), hidden_states, temb)
             else:
                 hidden_states = resnet(hidden_states, temb)
+
+            if i == len(self.resnets) - 1 and adapter_feature is not None:
+                hidden_states += adapter_feature
 
             output_states += (hidden_states,)
 

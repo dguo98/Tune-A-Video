@@ -1,7 +1,7 @@
 import os
 
 from tuneavideo.pipelines.pipeline_tuneavideo import TuneAVideoPipeline
-from tuneavideo.models.adapter import StyleAdapter
+from tuneavideo.models.adapter import build_adapters, get_adapter_features
 from tuneavideo.models.unet import UNet3DConditionModel
 from tuneavideo.util import save_videos_grid
 
@@ -39,33 +39,64 @@ def image_grid(imgs, rows, cols):
 
 
 
-def tvideo_inference(style_image=None, savename=None):
-    # pretrained_model_path = "./checkpoints/models--CompVis--stable-diffusion-v1-4/snapshots/3857c45b7d4e78b3ba0f39d4d7f50a2a05aa23d4"
-    pretrained_model_path = "./checkpoints/stable-diffusion-v1-4"
-    my_model_path = "./outputs/car-turn"
-    unet = UNet3DConditionModel.from_pretrained(my_model_path, subfolder='unet', torch_dtype=torch.float16).to('cuda')
+def tvideo_inference(
+    prompt="a white car is turning, white Jeep car, grey road with no shadows, white mountains, snow on the mountain,  acrylic painting, trending on pixiv fanbox, palette knife and brush strokes, style of makoto shinkai jamie wyeth james gilleard edward hopper greg rutkowski studio ghibli genshin impact, best quality, extremely detailed",
+    video_path="data/car-turn.mp4",
+    pretrained_model_path="./checkpoints/models--CompVis--stable-diffusion-v1-4/snapshots/3857c45b7d4e78b3ba0f39d4d7f50a2a05aa23d4",
+    tvideo_model_path="./outputs/car-turn",
+    adapter_input=None,  # Example: {'style': 'xxx.jpg', 'color': 'xxx.jpg'}
+    adapter_video_condition=None,  # Example: ['sketch', 'canny']
+    use_adapter_fuser=False,
+    savename=None
+):
+    batch_size = 1 if isinstance(prompt, str) else len(prompt)
 
-    if style_image is not None:
-        style_adapter = StyleAdapter(width=1024, context_dim=768, num_head=8, n_layes=3, num_token=8).to("cuda")
-        ckpt_path = "./checkpoints/T2I-Adapter/models/t2iadapter_style_sd14v1.pth"
-        style_adapter.load_state_dict(torch.load(ckpt_path))
+    ddim_inv_latent = torch.load(f"{tvideo_model_path}/inv_latents/ddim_latent-500.pt").to(torch.float16)
+    # Note: this latent's shape assumes num_videos_per_prompt == 1
+    ddim_inv_latent = ddim_inv_latent.repeat(batch_size, 1, 1, 1, 1)
+    sample_start_idx=0
+    sample_frame_rate=2
+    video_length = ddim_inv_latent.shape[2]
+
+    if adapter_input or adapter_video_condition:
+        adapter_types, batch_dims = [], []
+        batch_dim_size = {'b': batch_size, 'f': video_length}
+        if adapter_input:
+            adapter_types += list(adapter_input.keys())
+            batch_dims += ['b'] * len(adapter_input)
+        else:
+            adapter_input = {}
+        if adapter_video_condition:
+            adapter_types += adapter_video_condition
+            batch_dims += ['f'] * len(adapter_video_condition)
+            video = get_video(
+                video_path, -1, -1, sample_start_idx, sample_frame_rate, video_length)
+            # TODO(Siyu): figure out decord outputs in BGR or RGB
+            video = [video[i].numpy() for i in range(video_length)]
+            for t in adapter_video_condition:
+                adapter_input[t] = video
+
+        if use_adapter_fuser:
+            adapter_types.append('fuser')
+            ckpt_format = './checkpoints/T2I-Adapter/models/coadapter-{}-sd15v1.pth'
+        else:
+            ckpt_format = './checkpoints/T2I-Adapter/models/t2iadapter_{}_sd14v1.pth'
+        adapters = build_adapters(
+            adapter_types, ckpt_format=ckpt_format, batch_dims=batch_dims)
+        adapter_features, style_embeddings = get_adapter_features(
+            adapter_input, adapters, batch_dim_size=batch_dim_size)
     else:
-        style_adapter = None
+        adapter_features = style_embeddings = None
 
+    unet = UNet3DConditionModel.from_pretrained(tvideo_model_path, subfolder='unet', torch_dtype=torch.float16).to('cuda')
     tvideo_pipe = TuneAVideoPipeline.from_pretrained(
-        pretrained_model_path, unet=unet, style_adapter=style_adapter, torch_dtype=torch.float16).to("cuda")
+        pretrained_model_path, unet=unet, torch_dtype=torch.float16).to("cuda")
     tvideo_pipe.enable_xformers_memory_efficient_attention()
     tvideo_pipe.enable_vae_slicing()
 
-
-    prompt = "a white car is turning, white Jeep car, grey road with no shadows, white mountains, snow on the mountain,  acrylic painting, trending on pixiv fanbox, palette knife and brush strokes, style of makoto shinkai jamie wyeth james gilleard edward hopper greg rutkowski studio ghibli genshin impact, best quality, extremely detailed"
-    ddim_inv_latent = torch.load(f"{my_model_path}/inv_latents/ddim_latent-500.pt").to(torch.float16)
-    if isinstance(style_image, list):
-        prompt = [prompt] * len(style_image)
-        ddim_inv_latent = ddim_inv_latent.repeat(len(style_image), 1, 1, 1, 1)
     video = tvideo_pipe(
         prompt, latents=ddim_inv_latent, video_length=24, height=512, width=512, num_inference_steps=50, guidance_scale=12.5,
-        style_image=style_image).videos
+        adapter_features=adapter_features, style_embeddings=style_embeddings).videos
 
     if savename is None:
         savename = prompt + '.gif'
@@ -185,6 +216,7 @@ def compose_inference(tvideo_ratio=0.5, control_ratio=0.5, suffix="car-turn", so
     if savename is None:
         savename = f"./{prompt}.gif"
     save_videos_grid(video, f"{savename}")
+
 
 def get_video(video_path, height, width, sample_start_idx, sample_frame_rate, n_sample_frames):
     vr = decord.VideoReader(video_path, width=width, height=height)
@@ -426,8 +458,31 @@ if __name__ == "__main__":
 
     os.makedirs("results/carturn", exist_ok=True)
 
-    tvideo_inference(savename="results/carturn/carturn.gif")
-    tvideo_inference(style_image=style_image, savename="results/carturn/carturn-style.gif")
+    adapter_types = ['sketch', 'depth', 'canny', 'color']
+    for num_adapters in range(len(adapter_types) + 1):
+        cur_adapter_types = adapter_types[:num_adapters]
+        type_str = ''.join(['-' + t for t in cur_adapter_types])
+        tvideo_inference(
+            prompt=["a white car is turning, white Jeep car, grey road with no shadows, white mountains, snow on the mountain,  acrylic painting, trending on pixiv fanbox, palette knife and brush strokes, style of makoto shinkai jamie wyeth james gilleard edward hopper greg rutkowski studio ghibli genshin impact, best quality, extremely detailed"] * 8,
+            video_path="data/car-turn.mp4",
+            pretrained_model_path="./checkpoints/stable-diffusion-v1-4",
+            tvideo_model_path="./outputs/car-turn",
+            adapter_input={'style': style_image},
+            adapter_video_condition=cur_adapter_types,
+            savename=f"results/carturn/carturn-style{type_str}-v1-4.gif"
+        )
+        tvideo_inference(
+            prompt=["a white car is turning, white Jeep car, grey road with no shadows, white mountains, snow on the mountain,  acrylic painting, trending on pixiv fanbox, palette knife and brush strokes, style of makoto shinkai jamie wyeth james gilleard edward hopper greg rutkowski studio ghibli genshin impact, best quality, extremely detailed"] * 8,
+            video_path="data/car-turn.mp4",
+            pretrained_model_path="./checkpoints/stable-diffusion-v1-5",
+            tvideo_model_path="./outputs/car-turn-v1-5",
+            adapter_input={'style': style_image},
+            adapter_video_condition=cur_adapter_types,
+            use_adapter_fuser=True,
+            savename=f"results/carturn/carturn-style{type_str}-v1-5.gif"
+        )
+
+    # tvideo_inference(savename="results/carturn/carturn.gif")
     #controlnet_inference()
 
     for tvideo_ratio in [0.0, 0.3, 1.0]:

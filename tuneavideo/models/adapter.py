@@ -1,8 +1,156 @@
 from collections import OrderedDict
 
+import cv2
 from diffusers import ModelMixin
+from PIL import Image
 import torch
 import torch.nn as nn
+
+from annotator.util import img2tensor, resize_image
+
+CONDITION_ID = {
+    'sketch': 0,
+    'keypose': 1,
+    'seg': 2,
+    'depth': 3,
+    'canny': 4,
+    'style': 5,
+    'color': 6,
+    'openpose': 7
+}
+
+
+def zero_module(module):
+    """
+    Zero out the parameters of a module and return it.
+    """
+    for p in module.parameters():
+        p.detach().zero_()
+    return module
+
+
+def conv_nd(dims, *args, **kwargs):
+    """
+    Create a 1D, 2D, or 3D convolution module.
+    """
+    if dims == 1:
+        return nn.Conv1d(*args, **kwargs)
+    elif dims == 2:
+        return nn.Conv2d(*args, **kwargs)
+    elif dims == 3:
+        return nn.Conv3d(*args, **kwargs)
+    raise ValueError(f"unsupported dimensions: {dims}")
+
+
+def avg_pool_nd(dims, *args, **kwargs):
+    """
+    Create a 1D, 2D, or 3D average pooling module.
+    """
+    if dims == 1:
+        return nn.AvgPool1d(*args, **kwargs)
+    elif dims == 2:
+        return nn.AvgPool2d(*args, **kwargs)
+    elif dims == 3:
+        return nn.AvgPool3d(*args, **kwargs)
+    raise ValueError(f"unsupported dimensions: {dims}")
+
+
+class Downsample(nn.Module):
+    """
+    A downsampling layer with an optional convolution.
+    :param channels: channels in the inputs and outputs.
+    :param use_conv: a bool determining if a convolution is applied.
+    :param dims: determines if the signal is 1D, 2D, or 3D. If 3D, then
+                 downsampling occurs in the inner-two dimensions.
+    """
+
+    def __init__(self, channels, use_conv, dims=2, out_channels=None, padding=1):
+        super().__init__()
+        self.channels = channels
+        self.out_channels = out_channels or channels
+        self.use_conv = use_conv
+        self.dims = dims
+        stride = 2 if dims != 3 else (1, 2, 2)
+        if use_conv:
+            self.op = conv_nd(
+                dims, self.channels, self.out_channels, 3, stride=stride, padding=padding
+            )
+        else:
+            assert self.channels == self.out_channels
+            self.op = avg_pool_nd(dims, kernel_size=stride, stride=stride)
+
+    def forward(self, x):
+        assert x.shape[1] == self.channels
+        return self.op(x)
+
+
+class ResnetBlock(nn.Module):
+    def __init__(self, in_c, out_c, down, ksize=3, sk=False, use_conv=True):
+        super().__init__()
+        ps = ksize // 2
+        if in_c != out_c or sk == False:
+            self.in_conv = nn.Conv2d(in_c, out_c, ksize, 1, ps)
+        else:
+            # print('n_in')
+            self.in_conv = None
+        self.block1 = nn.Conv2d(out_c, out_c, 3, 1, 1)
+        self.act = nn.ReLU()
+        self.block2 = nn.Conv2d(out_c, out_c, ksize, 1, ps)
+        if sk == False:
+            self.skep = nn.Conv2d(in_c, out_c, ksize, 1, ps)
+        else:
+            self.skep = None
+
+        self.down = down
+        if self.down == True:
+            self.down_opt = Downsample(in_c, use_conv=use_conv)
+
+    def forward(self, x):
+        if self.down == True:
+            x = self.down_opt(x)
+        if self.in_conv is not None:  # edit
+            x = self.in_conv(x)
+
+        h = self.block1(x)
+        h = self.act(h)
+        h = self.block2(h)
+        if self.skep is not None:
+            return h + self.skep(x)
+        else:
+            return h + x
+
+
+class Adapter(nn.Module):
+    def __init__(self, channels=[320, 640, 1280, 1280], nums_rb=3, cin=64, ksize=3, sk=False, use_conv=True):
+        super(Adapter, self).__init__()
+        self.unshuffle = nn.PixelUnshuffle(8)
+        self.channels = channels
+        self.nums_rb = nums_rb
+        self.body = []
+        for i in range(len(channels)):
+            for j in range(nums_rb):
+                if (i != 0) and (j == 0):
+                    self.body.append(
+                        ResnetBlock(channels[i - 1], channels[i], down=True, ksize=ksize, sk=sk, use_conv=use_conv))
+                else:
+                    self.body.append(
+                        ResnetBlock(channels[i], channels[i], down=False, ksize=ksize, sk=sk, use_conv=use_conv))
+        self.body = nn.ModuleList(self.body)
+        self.conv_in = nn.Conv2d(cin, channels[0], 3, 1, 1)
+
+    def forward(self, x):
+        # unshuffle
+        x = self.unshuffle(x)
+        # extract features
+        features = []
+        x = self.conv_in(x)
+        for i in range(len(self.channels)):
+            for j in range(self.nums_rb):
+                idx = i * self.nums_rb + j
+                x = self.body[idx](x)
+            features.append(x)
+
+        return features
 
 
 class LayerNorm(nn.LayerNorm):
@@ -70,3 +218,332 @@ class StyleAdapter(ModelMixin):
         x = x @ self.proj
 
         return x
+
+
+class ResnetBlock_light(nn.Module):
+    def __init__(self, in_c):
+        super().__init__()
+        self.block1 = nn.Conv2d(in_c, in_c, 3, 1, 1)
+        self.act = nn.ReLU()
+        self.block2 = nn.Conv2d(in_c, in_c, 3, 1, 1)
+
+    def forward(self, x):
+        h = self.block1(x)
+        h = self.act(h)
+        h = self.block2(h)
+
+        return h + x
+
+
+class extractor(nn.Module):
+    def __init__(self, in_c, inter_c, out_c, nums_rb, down=False):
+        super().__init__()
+        self.in_conv = nn.Conv2d(in_c, inter_c, 1, 1, 0)
+        self.body = []
+        for _ in range(nums_rb):
+            self.body.append(ResnetBlock_light(inter_c))
+        self.body = nn.Sequential(*self.body)
+        self.out_conv = nn.Conv2d(inter_c, out_c, 1, 1, 0)
+        self.down = down
+        if self.down == True:
+            self.down_opt = Downsample(in_c, use_conv=False)
+
+    def forward(self, x):
+        if self.down == True:
+            x = self.down_opt(x)
+        x = self.in_conv(x)
+        x = self.body(x)
+        x = self.out_conv(x)
+
+        return x
+
+
+class Adapter_light(nn.Module):
+    def __init__(self, channels=[320, 640, 1280, 1280], nums_rb=3, cin=64):
+        super(Adapter_light, self).__init__()
+        self.unshuffle = nn.PixelUnshuffle(8)
+        self.channels = channels
+        self.nums_rb = nums_rb
+        self.body = []
+        for i in range(len(channels)):
+            if i == 0:
+                self.body.append(extractor(in_c=cin, inter_c=channels[i]//4, out_c=channels[i], nums_rb=nums_rb, down=False))
+            else:
+                self.body.append(extractor(in_c=channels[i-1], inter_c=channels[i]//4, out_c=channels[i], nums_rb=nums_rb, down=True))
+        self.body = nn.ModuleList(self.body)
+
+    def forward(self, x):
+        # unshuffle
+        x = self.unshuffle(x)
+        # extract features
+        features = []
+        for i in range(len(self.channels)):
+            x = self.body[i](x)
+            features.append(x)
+
+        return features
+
+
+class CoAdapterFuser(nn.Module):
+    def __init__(self, unet_channels=[320, 640, 1280, 1280], width=768, num_head=8, n_layes=3):
+        super(CoAdapterFuser, self).__init__()
+        scale = width ** 0.5
+        # 16, maybe large enough for the number of adapters?
+        self.task_embedding = nn.Parameter(scale * torch.randn(16, width))
+        self.positional_embedding = nn.Parameter(scale * torch.randn(len(unet_channels), width))
+        self.spatial_feat_mapping = nn.ModuleList()
+        for ch in unet_channels:
+            self.spatial_feat_mapping.append(nn.Sequential(
+                nn.SiLU(),
+                nn.Linear(ch, width),
+            ))
+        self.transformer_layes = nn.Sequential(*[ResidualAttentionBlock(width, num_head) for _ in range(n_layes)])
+        self.ln_post = LayerNorm(width)
+        self.ln_pre = LayerNorm(width)
+        self.spatial_ch_projs = nn.ModuleList()
+        for ch in unet_channels:
+            self.spatial_ch_projs.append(zero_module(nn.Linear(width, ch)))
+        self.seq_proj = nn.Parameter(torch.zeros(width, width))
+
+    def forward(self, features):
+        if len(features) == 0:
+            return None, None
+        inputs = []
+        for cond_name in features.keys():
+            task_idx = CONDITION_ID[cond_name]
+            if not isinstance(features[cond_name], list):
+                inputs.append(features[cond_name] + self.task_embedding[task_idx])
+                continue
+
+            feat_seq = []
+            for idx, feature_map in enumerate(features[cond_name]):
+                feature_vec = torch.mean(feature_map, dim=(2, 3))
+                feature_vec = self.spatial_feat_mapping[idx](feature_vec)
+                feat_seq.append(feature_vec)
+            feat_seq = torch.stack(feat_seq, dim=1)  # Nx4xC
+            feat_seq = feat_seq + self.task_embedding[task_idx]
+            feat_seq = feat_seq + self.positional_embedding
+            inputs.append(feat_seq)
+
+        x = torch.cat(inputs, dim=1)  # NxLxC
+        x = self.ln_pre(x)
+        x = x.permute(1, 0, 2)  # NLD -> LND
+        x = self.transformer_layes(x)
+        x = x.permute(1, 0, 2)  # LND -> NLD
+        x = self.ln_post(x)
+
+        ret_feat_map = None
+        ret_feat_seq = None
+        cur_seq_idx = 0
+        for cond_name in features.keys():
+            if not isinstance(features[cond_name], list):
+                length = features[cond_name].size(1)
+                transformed_feature = features[cond_name] * ((x[:, cur_seq_idx:cur_seq_idx+length] @ self.seq_proj) + 1)
+                if ret_feat_seq is None:
+                    ret_feat_seq = transformed_feature
+                else:
+                    ret_feat_seq = torch.cat([ret_feat_seq, transformed_feature], dim=1)
+                cur_seq_idx += length
+                continue
+
+            length = len(features[cond_name])
+            transformed_feature_list = []
+            for idx in range(length):
+                alpha = self.spatial_ch_projs[idx](x[:, cur_seq_idx+idx])
+                alpha = alpha.unsqueeze(-1).unsqueeze(-1) + 1
+                transformed_feature_list.append(features[cond_name][idx] * alpha)
+            if ret_feat_map is None:
+                ret_feat_map = transformed_feature_list
+            else:
+                ret_feat_map = list(map(lambda x, y: x + y, ret_feat_map, transformed_feature_list))
+            cur_seq_idx += length
+
+        assert cur_seq_idx == x.size(1)
+
+        return ret_feat_map, ret_feat_seq
+
+
+def build_adapters(
+    adapter_types,
+    ckpt_format='./checkpoints/T2I-Adapter/models/t2iadapter_{}_sd14v1.pth',
+    weights=None,
+    batch_dims=None,  # batch along 'b' or 'f' in [b, c, f, h, w]
+    device='cuda'
+):
+    ret = {}
+    for i, t in enumerate(adapter_types):
+        if t in ret:
+            raise ValueError(f'Duplicate adapter type {t} in {adapter_types}')
+
+        if t != 'fuser':
+            if weights is None:
+                weight = 1.
+            else:
+                weight = weights[i]
+            if batch_dims is None:
+                batch_dim = 'b'
+            else:
+                batch_dim = batch_dims[i]
+            ret[t] = {'weight': weight, 'batch_dim': batch_dim}
+        else:
+            ret[t] = {}
+
+        if t == 'color':
+            adapter = Adapter_light(
+                cin=64,
+                channels=[320, 640, 1280, 1280],
+                nums_rb=4).to(device)
+        elif t in ['sketch', 'keypose', 'seg', 'depth', 'canny', 'openpose']:
+            cond_ch = 1 if t in ['sketch', 'canny'] else 3
+            adapter = Adapter(
+                cin=64 * cond_ch,
+                channels=[320, 640, 1280, 1280],
+                nums_rb=2,
+                ksize=1,
+                sk=True,
+                use_conv=False).to(device)
+
+        if t == 'fuser':
+            adapter = CoAdapterFuser(
+                unet_channels=[320, 640, 1280, 1280], width=768, num_head=8, n_layes=3).to(device)
+            preprocessor = None
+        elif t == 'sketch':
+            from annotator.sketch.model_edge import pidinet
+            preprocessor = pidinet()
+            ckpt = torch.load(
+                './checkpoints/T2I-Adapter/third-party-models/table5_pidinet.pth', map_location='cpu')['state_dict']
+            preprocessor.load_state_dict({k.replace('module.', ''): v for k, v in ckpt.items()}, strict=True)
+            preprocessor.to(device)
+        elif t in ['keypose', 'seg']:
+            raise NotImplementedError('TO-DO')
+        elif t == 'depth':
+            from annotator.midas import MidasDetector
+            preprocessor = MidasDetector().to(device)
+        elif t == 'canny':
+            from annotator.canny import CannyDetector
+            preprocessor = CannyDetector()
+        elif t == 'style':
+            adapter = StyleAdapter(
+                width=1024, context_dim=768, num_head=8, n_layes=3, num_token=8).to(device)
+
+            from transformers import CLIPProcessor, CLIPVisionModel
+            model_name = 'openai/clip-vit-large-patch14'
+            processor = CLIPProcessor.from_pretrained(model_name)
+            clip_vision_model = CLIPVisionModel.from_pretrained(model_name).to(device)
+            preprocessor = {'processor': processor, 'clip_vision_model': clip_vision_model}
+        elif t == 'color':
+            preprocessor = None
+        elif t == 'openpose':
+            from annotator.openpose import OpenposeDetector
+            preprocessor = OpenposeDetector().to(device)
+        else:
+            raise NotImplementedError(f'Unknown adapter type {t}')
+
+        ckpt_path = ckpt_format.format(t)
+        adapter.load_state_dict(torch.load(ckpt_path))
+        ret[t]['model'] = adapter
+        ret[t]['preprocessor'] = preprocessor
+    return ret
+
+
+def get_adapter_features(inputs, adapters, batch_dim_size, resolution=512, device='cuda', dtype=torch.float16):
+    def broadcast(x, batch_dim):
+        if isinstance(x, list):
+            return [broadcast(t, batch_dim) for t in x]
+
+        shape = x.shape
+        x = x.flatten(start_dim=1)
+        if shape[0] != batch_dim_size[batch_dim]:
+            print(shape, batch_dim)
+            assert shape[0] == 1
+            x = x.repeat(batch_dim_size[batch_dim], 1)
+        if batch_dim == 'b':
+            x = x.unsqueeze(1).repeat(1, batch_dim_size['f'], 1)
+        else:
+            x = x.unsqueeze(0).repeat(batch_dim_size['b'], 1, 1)
+        return x.view(batch_dim_size['b'] * batch_dim_size['f'], *shape[1:])
+
+    with torch.no_grad():
+        feats = {}
+        for t in inputs:
+            input = inputs[t]
+            adapter = adapters[t]
+            if not isinstance(input, list):
+                input = [input]
+            images = []
+            for i in input:
+                if isinstance(i, str):
+                    images.append(Image.open(i) if t == 'style' else cv2.imread(i))
+                else:
+                    # convert from RGB numpy array
+                    images.append(Image.fromarray(i) if t == 'style' else cv2.cvtColor(i, cv2.COLOR_RGB2BGR))
+
+            preprocessor = adapter['preprocessor']
+            if t == 'style':
+                feat = preprocessor['processor'](images=images, return_tensors="pt")['pixel_values']
+                feat = preprocessor['clip_vision_model'](feat.to(device))['last_hidden_state']
+                feat = adapter['model'](feat) * adapter['weight']
+            else:
+                feat = []
+                for i in images:
+                    image = resize_image(i, resolution)
+                    if t == 'sketch':
+                        image = img2tensor(image).unsqueeze(0) / 255.
+                        image = preprocessor(image.to(device))[-1]
+                    elif t == 'depth':
+                        image = img2tensor(image).unsqueeze(0) / 127.5 - 1.0
+                        image = preprocessor(image.to(device)).repeat(1, 3, 1, 1)
+                        image -= torch.min(image)
+                        image /= torch.max(image)
+                    elif t == 'canny':
+                        image = preprocessor(image, 100, 200)[..., None]
+                        image = img2tensor(image).unsqueeze(0) / 255.
+                        image = image.to(device)
+                    elif t == 'color':
+                        H, W = image.shape[:2]
+                        image = cv2.resize(image, (W // 64, H // 64), interpolation=cv2.INTER_CUBIC)
+                        image = cv2.resize(image, (W, H), interpolation=cv2.INTER_NEAREST)
+                        image = img2tensor(image).unsqueeze(0) / 255.
+                        image = image.to(device)
+                    elif t == 'openpose':
+                        with autocast('cuda', dtype=torch.float32):
+                            image = preprocessor(image)
+                        image = img2tensor(image).unsqueeze(0) / 255.
+                        image = image.to(device)
+                    else:
+                        raise NotImplementedError('TO-DO')
+                    feat.append(image.detach())
+                feat = torch.cat(feat, dim=0)
+                feat = adapter['model'](feat)
+                feat = [f * adapter['weight'] for f in feat]
+
+            feats[t] = broadcast(feat, adapter['batch_dim'])
+
+    if 'fuser' in adapters:
+        adapter_features, style_embeddings = adapters['fuser']['model'](feats)
+
+    adapter_features = None
+    style_embeddings = None
+    for feat in feats.values():
+        if isinstance(feat, list):
+            if adapter_features is None:
+                adapter_features = feat
+            else:
+                adapter_features = list(map(lambda x, y: x + y, adapter_features, feat))
+        else:
+            if style_embeddings is None:
+                style_embeddings = feat
+            else:
+                style_embeddings = torch.cat([style_embeddings, feat], dim=1)
+
+    if adapter_features is not None:
+        for i in range(len(adapter_features)):
+            # [b * f, c, h, w] -> [b, c, f, h, w]
+            shape = adapter_features[i].shape
+            adapter_features[i] = torch.transpose(adapter_features[i].view(
+                batch_dim_size['b'], batch_dim_size['f'], *shape[1:]), 1, 2).to(dtype)
+    if style_embeddings is not None:
+        # TODO(Siyu): simply taking frame 0 can be wrong in the case with fuser
+        style_embeddings = style_embeddings[::batch_dim_size['f']].to(dtype)
+
+    return adapter_features, style_embeddings
