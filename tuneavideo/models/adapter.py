@@ -390,7 +390,7 @@ def build_adapters(
 
         if t == 'color':
             adapter = Adapter_light(
-                cin=64,
+                cin=192,
                 channels=[320, 640, 1280, 1280],
                 nums_rb=4).to(device)
         elif t in ['sketch', 'keypose', 'seg', 'depth', 'canny', 'openpose']:
@@ -417,8 +417,8 @@ def build_adapters(
         elif t in ['keypose', 'seg']:
             raise NotImplementedError('TO-DO')
         elif t == 'depth':
-            from annotator.midas import MidasDetector
-            preprocessor = MidasDetector().to(device)
+            from annotator.midas.api import MiDaSInference
+            preprocessor = MiDaSInference(model_type="dpt_hybrid").to(device)
         elif t == 'canny':
             from annotator.canny import CannyDetector
             preprocessor = CannyDetector()

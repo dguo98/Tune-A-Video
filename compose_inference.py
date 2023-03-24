@@ -459,7 +459,7 @@ if __name__ == "__main__":
     os.makedirs("results/carturn", exist_ok=True)
 
     adapter_types = ['sketch', 'depth', 'canny', 'color']
-    for num_adapters in range(len(adapter_types) + 1):
+    for num_adapters in range(4, len(adapter_types) + 1):
         cur_adapter_types = adapter_types[:num_adapters]
         type_str = ''.join(['-' + t for t in cur_adapter_types])
         tvideo_inference(
